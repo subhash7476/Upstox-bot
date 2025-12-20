@@ -36,4 +36,3 @@ def fetch_and_save_data(symbol: str,
     except Exception as e:
         # bubble up; page will catch and present error
         raise
-

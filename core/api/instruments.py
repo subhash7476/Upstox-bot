@@ -117,4 +117,3 @@ def load_segment_instruments(segment: str) -> pd.DataFrame:
 
 def list_segments():
     return [p.stem for p in SEGMENT_DIR.glob("*.parquet")]
-
