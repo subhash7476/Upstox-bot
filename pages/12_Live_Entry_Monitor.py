@@ -1,34 +1,21 @@
-# pages/13_Live_Entry_Monitor.py
+# pages/12_Live_Entry_Monitor.py
 """
-Live Entry Signal Monitor
-Uses Upstox WebSocket feed to monitor validated stocks for entry signals in REAL-TIME
-
-Flow:
-1. Input validated stocks (from Page 10)
-2. Connect to live market data feed (WebSocket)
-3. Aggregate ticks → 1-min → 15-min candles
-4. Calculate indicators in real-time
-5. Generate INSTANT alerts when entry conditions met
-
-Based on architecture from 11_Simple_supertrend.py
+Live Entry Monitor - FINAL WORKING VERSION
+- Loads shortlisted stocks from data/state/shortlisted_stocks.csv
+- Uses Upstox v2 API with symbol mapping fix
+- Works with TradingDB structure
 """
 
 import streamlit as st
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
-import threading
-import asyncio
-import websockets
 import requests
 import json
 import time
-import queue
 import os
-from google.protobuf.json_format import MessageToDict
-import MarketDataFeed_pb2 as pb
-from streamlit.runtime.scriptrunner import add_script_run_ctx
 from pathlib import Path
+from datetime import datetime, date, timedelta
 import sys
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -36,581 +23,799 @@ if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
 from core.config import get_access_token
-from core.api.instruments import load_segment_instruments
+from core.database import TradingDB
+from core.indicators import compute_supertrend
 
-st.set_page_config(page_title="Live Entry Monitor", layout="wide")
-st.title("🎯 Live Entry Signal Monitor")
+st.set_page_config(page_title="Live Entry Monitor", layout="wide", page_icon="🎯")
 
 # =====================================================================
 # CONFIGURATION
 # =====================================================================
 
-# Entry signal parameters
-PULLBACK_EMA_PERIOD = 21
-RSI_PERIOD = 14
-VOLUME_SPIKE_THRESHOLD = 1.3
+# Try multiple possible locations for shortlisted stocks
+RESULTS_PATHS = [
+    "data/state/shortlisted_stocks.csv",  # Primary (from Daily Analyzer)
+    "data/daily_analyzer_results.csv",     # Legacy
+    "data/shortlisted_stocks.csv"          # Alternative
+]
+
+LIVE_CACHE_TABLE = "live_ohlcv_cache"
 
 # =====================================================================
-# INDICATOR CALCULATIONS
+# API CLASS WITH SYMBOL MAPPING FIX
 # =====================================================================
-def calculate_indicators(df):
-    """Calculate all indicators needed for entry signals"""
+
+class UpstoxMarketData:
+    """
+    Upstox Market Data API v2
+    Handles NSE_EQ|ISIN (request) vs NSE_EQ:SYMBOL (response)
+    """
+    
+    BASE_URL = "https://api.upstox.com/v2"
+    
+    def __init__(self, access_token: str):
+        self.access_token = access_token
+        self.headers = {
+            'Content-Type': 'application/json',
+            'Accept': 'application/json',
+            'Authorization': f'Bearer {access_token}'
+        }
+    
+    def get_market_quote(self, instrument_keys: list, symbol_map: dict) -> dict:
+        """
+        Get market quotes
+        
+        Args:
+            instrument_keys: List of NSE_EQ|INE... keys
+            symbol_map: Dict mapping instrument_key -> trading_symbol
+        
+        Returns:
+            Dict mapping instrument_key -> quote data
+        """
+        if not instrument_keys:
+            return {}
+        
+        keys_param = ",".join(instrument_keys)
+        url = f"{self.BASE_URL}/market-quote/quotes"
+        params = {"instrument_key": keys_param}
+        
+        try:
+            response = requests.get(url, headers=self.headers, params=params, timeout=10)
+            response.raise_for_status()
+            
+            data = response.json()
+            
+            if data.get('status') != 'success':
+                raise Exception(f"API Error: {data.get('message')}")
+            
+            # Map response keys back to instrument keys
+            return self._map_response(data.get('data', {}), instrument_keys, symbol_map)
+            
+        except Exception as e:
+            st.error(f"API Error: {e}")
+            return {}
+    
+    def _map_response(self, response_data: dict, inst_keys: list, symbol_map: dict) -> dict:
+        """Map response (NSE_EQ:SYMBOL) back to instrument keys (NSE_EQ|ISIN)"""
+        quotes = {}
+        
+        # Build reverse lookup: symbol -> inst_key
+        symbol_to_key = {v: k for k, v in symbol_map.items()}
+        
+        for response_key, quote_data in response_data.items():
+            if not isinstance(quote_data, dict):
+                continue
+            
+            # Extract symbol from quote
+            symbol = quote_data.get('symbol')
+            
+            if symbol and symbol in symbol_to_key:
+                inst_key = symbol_to_key[symbol]
+                quotes[inst_key] = quote_data
+        
+        return quotes
+    
+    def build_1min_candle(self, quote_data: dict) -> dict:
+        """Convert quote to candle"""
+        ohlc = quote_data.get('ohlc', {})
+        now = datetime.now()
+        timestamp = now.replace(second=0, microsecond=0)
+        
+        return {
+            'timestamp': timestamp,
+            'open': float(ohlc.get('open', 0)),
+            'high': float(ohlc.get('high', 0)),
+            'low': float(ohlc.get('low', 0)),
+            'close': float(quote_data.get('last_price', ohlc.get('close', 0))),
+            'volume': int(quote_data.get('volume', 0))
+        }
+
+# =====================================================================
+# DATABASE FUNCTIONS
+# =====================================================================
+
+@st.cache_resource
+def get_db():
+    """Get database connection"""
+    return TradingDB()
+
+def init_live_cache_table():
+    """Initialize live cache table"""
+    db = get_db()
+    
+    db.con.execute(f"""
+        CREATE TABLE IF NOT EXISTS {LIVE_CACHE_TABLE} (
+            symbol VARCHAR,
+            timestamp TIMESTAMP,
+            open DOUBLE,
+            high DOUBLE,
+            low DOUBLE,
+            close DOUBLE,
+            volume BIGINT,
+            PRIMARY KEY (symbol, timestamp)
+        )
+    """)
+
+def fetch_historical_ohlcv(symbol: str, instrument_key: str, days: int = 5) -> pd.DataFrame:
+    """Fetch historical 1-minute OHLCV data using instrument_key"""
+    db = get_db()
+    
+    end_date = datetime.now().date()
+    start_date = end_date - timedelta(days=days)
+    
+    query = f"""
+        SELECT 
+            timestamp,
+            open as Open,
+            high as High,
+            low as Low,
+            close as Close,
+            volume as Volume
+        FROM ohlcv_1m
+        WHERE instrument_key = '{instrument_key}'
+          AND DATE(timestamp) >= '{start_date}'
+          AND DATE(timestamp) < '{end_date}'
+        ORDER BY timestamp
+    """
+    
+    try:
+        df = db.con.execute(query).df()
+        if not df.empty:
+            df['timestamp'] = pd.to_datetime(df['timestamp'])
+            df.set_index('timestamp', inplace=True)
+        return df
+    except Exception as e:
+        st.error(f"Error fetching historical data for {symbol}: {e}")
+        return pd.DataFrame()
+
+def get_todays_cached_data(symbol: str) -> pd.DataFrame:
+    """
+    Get today's cached data from live_ohlcv_cache
+    This fills the gap between yesterday's close and current time
+    """
+    db = get_db()
+    
+    today = datetime.now().date()
+    
+    query = f"""
+        SELECT 
+            timestamp,
+            open as Open,
+            high as High,
+            low as Low,
+            close as Close,
+            volume as Volume
+        FROM {LIVE_CACHE_TABLE}
+        WHERE symbol = '{symbol}'
+          AND DATE(timestamp) = '{today}'
+        ORDER BY timestamp
+    """
+    
+    try:
+        df = db.con.execute(query).df()
+        if not df.empty:
+            df['timestamp'] = pd.to_datetime(df['timestamp'])
+            df.set_index('timestamp', inplace=True)
+        return df
+    except Exception as e:
+        # Silently return empty - error will show in main UI
+        return pd.DataFrame()
+
+def save_live_candle(symbol: str, candle_data: dict):
+    """Save current candle to cache"""
+    db = get_db()
+    
+    try:
+        db.con.execute(f"""
+            INSERT OR REPLACE INTO {LIVE_CACHE_TABLE}
+            (symbol, timestamp, open, high, low, close, volume)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, [
+            symbol,
+            candle_data['timestamp'],
+            candle_data['open'],
+            candle_data['high'],
+            candle_data['low'],
+            candle_data['close'],
+            candle_data['volume']
+        ])
+    except Exception as e:
+        st.warning(f"Error caching {symbol}: {e}")
+
+def get_instrument_key(symbol: str) -> str:
+    """Get instrument key for symbol"""
+    db = get_db()
+    
+    query = f"""
+        SELECT instrument_key
+        FROM instruments
+        WHERE trading_symbol = '{symbol}'
+          AND segment = 'NSE_EQ'
+        LIMIT 1
+    """
+    
+    try:
+        result = db.con.execute(query).fetchone()
+        return result[0] if result else None
+    except:
+        return None
+
+# =====================================================================
+# LOAD SHORTLISTED STOCKS
+# =====================================================================
+
+def load_shortlisted_stocks() -> pd.DataFrame:
+    """
+    Load shortlisted stocks from multiple possible locations
+    """
+    for results_path in RESULTS_PATHS:
+        file_path = Path(results_path)
+        
+        if file_path.exists():
+            try:
+                df = pd.read_csv(file_path)
+                
+                # Validate required columns
+                required_cols = ['Symbol']
+                if all(col in df.columns for col in required_cols):
+                    st.info(f"✅ Loaded from: `{results_path}`")
+                    return df
+                    
+            except Exception as e:
+                st.warning(f"Error reading {results_path}: {e}")
+                continue
+    
+    return pd.DataFrame()
+
+# =====================================================================
+# INDICATORS & SIGNALS
+# =====================================================================
+
+def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    """Calculate technical indicators"""
     if len(df) < 50:
         return df
     
     df = df.copy()
     
-    # EMAs for pullback detection
-    df['EMA_9'] = df['Close'].ewm(span=9).mean()
-    df['EMA_21'] = df['Close'].ewm(span=21).mean()
-    df['EMA_50'] = df['Close'].ewm(span=50).mean()
+    # EMAs
+    df['EMA_9'] = df['Close'].ewm(span=9, adjust=False).mean()
+    df['EMA_21'] = df['Close'].ewm(span=21, adjust=False).mean()
     
     # RSI
     delta = df['Close'].diff()
-    gain = (delta.where(delta > 0, 0)).rolling(window=RSI_PERIOD).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(window=RSI_PERIOD).mean()
-    rs = gain / loss
+    gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+    rs = gain / loss.replace(0, np.nan)
     df['RSI'] = 100 - (100 / (1 + rs))
     
-    # Volume analysis
+    # Volume MA
     df['Volume_MA'] = df['Volume'].rolling(20).mean()
-    df['Volume_Ratio'] = df['Volume'] / df['Volume_MA']
     
-    # ATR for volatility
-    high = df['High']
-    low = df['Low']
-    close = df['Close']
-    tr1 = high - low
-    tr2 = (high - close.shift(1)).abs()
-    tr3 = (low - close.shift(1)).abs()
-    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-    df['ATR'] = tr.ewm(alpha=1/14, adjust=False).mean()
+    # ATR
+    high_low = df['High'] - df['Low']
+    high_close = np.abs(df['High'] - df['Close'].shift())
+    low_close = np.abs(df['Low'] - df['Close'].shift())
+    ranges = pd.concat([high_low, high_close, low_close], axis=1)
+    true_range = ranges.max(axis=1)
+    df['ATR'] = true_range.rolling(14).mean()
     
     return df
 
-
-def detect_pullback_entry_live(df, regime='Trending Bullish'):
-    """
-    Detect pullback entry in real-time
-    
-    For Trending Bullish regime:
-    1. Price pulls back to EMA21
-    2. RSI cools off (40-60)
-    3. Green candle forms (bounce)
-    4. Volume spike confirms
-    
-    Returns: Dict with signal status
-    """
+def detect_entry_signal(df: pd.DataFrame, regime: str = "Trending Bullish") -> dict:
+    """Detect entry signals"""
     if len(df) < 50:
-        return {'signal': False, 'status': 'Collecting data', 'progress': f'{len(df)}/50'}
+        return {
+            'signal': False,
+            'status': f'⏳ Building data ({len(df)}/50 candles)',
+            'reason': 'Insufficient data'
+        }
     
-    # Latest values
     current = df.iloc[-1]
-    prev = df.iloc[-2]
     
-    current_close = current['Close']
-    current_rsi = current['RSI']
-    current_volume_ratio = current['Volume_Ratio']
-    ema_21 = current['EMA_21']
-    ema_9 = current['EMA_9']
-    
-    # Check if in pullback zone
-    dist_to_ema21 = abs(current_close - ema_21) / current_close
-    near_ema21 = dist_to_ema21 < 0.01  # Within 1%
-    
-    dist_to_ema9 = abs(current_close - ema_9) / current_close
-    near_ema9 = dist_to_ema9 < 0.005  # Within 0.5%
-    
-    # RSI cooled off
-    rsi_cooled = 40 <= current_rsi <= 60
-    
-    # Bounce confirmation (green candle after red)
-    current_green = current['Close'] > current['Open']
-    prev_red = prev['Close'] < prev['Open']
-    bounced = current_green and prev_red
-    
-    # Volume spike
-    volume_spike = current_volume_ratio > VOLUME_SPIKE_THRESHOLD
-    
-    # ENTRY SIGNAL
-    if (near_ema21 or near_ema9) and rsi_cooled and bounced and volume_spike:
-        entry_price = current_close
-        stop_loss = min(ema_21, df['Low'].iloc[-5:].min()) * 0.995
-        target = entry_price + (entry_price - stop_loss) * 2
-        
-        return {
-            'signal': True,
-            'type': 'PULLBACK ENTRY',
-            'status': '🚀 BUY SIGNAL',
-            'entry_price': round(entry_price, 2),
-            'stop_loss': round(stop_loss, 2),
-            'target': round(target, 2),
-            'rsi': round(current_rsi, 1),
-            'volume_ratio': round(current_volume_ratio, 2),
-            'reason': f'Pullback to EMA{21 if near_ema21 else 9}, RSI {current_rsi:.1f}, Bounce + Volume {current_volume_ratio:.1f}x'
-        }
-    
-    # WAITING STATE
-    elif (near_ema21 or near_ema9) and rsi_cooled:
+    # Check for NaN
+    if pd.isna(current['Close']) or pd.isna(current['EMA_21']):
         return {
             'signal': False,
-            'status': '⏳ WAITING',
-            'reason': f'In pullback zone (RSI {current_rsi:.1f}), waiting for bounce + volume',
-            'watch_for': 'Green candle with volume spike'
+            'status': '⚠️ Calculating indicators...',
+            'reason': 'NaN values'
         }
     
-    # NOT READY
-    else:
-        status_parts = []
-        if not (near_ema21 or near_ema9):
-            status_parts.append(f'Price {current_close:.2f} not near EMA21 ({ema_21:.2f})')
-        if not rsi_cooled:
-            status_parts.append(f'RSI {current_rsi:.1f} not in 40-60 range')
-        
-        return {
-            'signal': False,
-            'status': '👀 MONITORING',
-            'reason': ' | '.join(status_parts) if status_parts else 'Conditions not met'
-        }
-
-
-# =====================================================================
-# WEBSOCKET WORKER (Multi-Symbol)
-# =====================================================================
-@st.cache_resource
-def get_shared_state():
-    """Global state for WebSocket data"""
+    # Signal conditions
+    near_ema = abs(current['Close'] - current['EMA_21']) / current['Close'] < 0.01
+    rsi_ok = 40 <= current['RSI'] <= 60
+    bullish_ema = current['EMA_9'] > current['EMA_21']
+    
+    # Check regime
+    if "Bullish" in regime:
+        if near_ema and rsi_ok and bullish_ema:
+            atr = current['ATR'] if not pd.isna(current['ATR']) else (current['Close'] * 0.02)
+            
+            entry = current['Close']
+            sl = current['EMA_21'] * 0.995
+            tp = entry + (2 * atr)
+            
+            return {
+                'signal': True,
+                'status': '🚀 BUY SIGNAL',
+                'entry_price': entry,
+                'stop_loss': sl,
+                'take_profit': tp,
+                'risk': entry - sl,
+                'reward': tp - entry,
+                'reason': f'Price near EMA21, RSI={current["RSI"]:.1f}, Bullish EMA'
+            }
+    
+    # No signal
+    reasons = []
+    if not near_ema:
+        pct_from_ema = abs(current['Close'] - current['EMA_21'])/current['Close']*100
+        reasons.append(f"{pct_from_ema:.2f}% from EMA21")
+    if not rsi_ok:
+        reasons.append(f"RSI={current['RSI']:.1f}")
+    if not bullish_ema:
+        reasons.append("EMAs bearish")
+    
     return {
-        "tick_queues": {},  # symbol -> queue
-        "stop_event": threading.Event(),
-        "status": {}  # symbol -> status
+        'signal': False,
+        'status': '👀 MONITORING',
+        'reason': ' | '.join(reasons)
     }
 
-shared = get_shared_state()
+# =====================================================================
+# MAIN UI
+# =====================================================================
 
-async def websocket_worker_multi(instrument_keys_dict):
-    """
-    WebSocket worker for multiple symbols
+def main():
+    st.title("🎯 Live Entry Monitor")
+    st.caption("Real-time monitoring for Daily Analyzer shortlisted stocks")
     
-    Args:
-        instrument_keys_dict: {symbol: instrument_key}
-    """
-    stop_event = shared["stop_event"]
+    # Initialize
+    init_live_cache_table()
     
-    while not stop_event.is_set():
-        token = get_access_token()
-        if not token:
-            for symbol in instrument_keys_dict.keys():
-                shared["status"][symbol] = "Auth Failed"
-            await asyncio.sleep(5)
-            continue
+    # Load shortlisted stocks
+    st.header("1️⃣ Shortlisted Stocks")
+    
+    results_df = load_shortlisted_stocks()
+    
+    if results_df.empty:
+        st.warning("⚠️ No shortlisted stocks found")
+        st.info("**Checked locations:**")
+        for path in RESULTS_PATHS:
+            exists = "✅" if Path(path).exists() else "❌"
+            st.write(f"{exists} `{path}`")
         
-        # Authorize
-        auth_url = "https://api.upstox.com/v3/feed/market-data-feed/authorize"
-        headers = {"Authorization": f"Bearer {token}"}
-        
-        try:
-            resp = requests.get(auth_url, headers=headers, timeout=5)
-            resp.raise_for_status()
-            ws_uri = resp.json()["data"]["authorized_redirect_uri"]
-        except Exception as e:
-            for symbol in instrument_keys_dict.keys():
-                shared["status"][symbol] = f"Auth Error: {e}"
-            await asyncio.sleep(5)
-            continue
-        
-        # Connect
-        try:
-            async with websockets.connect(ws_uri) as ws:
-                # Subscribe to all symbols
-                instrument_keys_list = list(instrument_keys_dict.values())
-                sub = {
-                    "guid": "multi_feed",
-                    "method": "sub",
-                    "data": {
-                        "mode": "full",
-                        "instrumentKeys": instrument_keys_list
-                    }
-                }
-                await ws.send(json.dumps(sub).encode('utf-8'))
-                
-                for symbol in instrument_keys_dict.keys():
-                    shared["status"][symbol] = "🟢 Connected"
-                
-                # Receive messages
-                while not stop_event.is_set():
-                    try:
-                        msg = await asyncio.wait_for(ws.recv(), timeout=2.0)
-                        feed = pb.FeedResponse()
-                        feed.ParseFromString(msg)
-                        feed_dict = MessageToDict(feed, preserving_proto_field_name=False)
-                        
-                        if "feeds" in feed_dict:
-                            for inst_key, fdata in feed_dict["feeds"].items():
-                                # Find which symbol this belongs to
-                                symbol = None
-                                for sym, key in instrument_keys_dict.items():
-                                    if key == inst_key:
-                                        symbol = sym
-                                        break
-                                
-                                if symbol is None:
-                                    continue
-                                
-                                full_feed = fdata.get("fullFeed", {})
-                                ltpc = {}
-                                vol = 0
-                                
-                                if "indexFF" in full_feed:
-                                    ltpc = full_feed["indexFF"].get("ltpc", {})
-                                elif "marketFF" in full_feed:
-                                    ltpc = full_feed["marketFF"].get("ltpc", {})
-                                    vol = int(full_feed["marketFF"].get("eFeedDetails", {}).get("tv", 0))
-                                
-                                if "ltp" in ltpc:
-                                    if symbol not in shared["tick_queues"]:
-                                        shared["tick_queues"][symbol] = queue.Queue()
-                                    
-                                    shared["tick_queues"][symbol].put({
-                                        "timestamp": pd.Timestamp.now(),
-                                        "price": float(ltpc["ltp"]),
-                                        "volume": vol
-                                    })
-                    
-                    except asyncio.TimeoutError:
-                        continue
-                    except websockets.exceptions.ConnectionClosed:
-                        for symbol in instrument_keys_dict.keys():
-                            shared["status"][symbol] = "🔴 Disconnected"
-                        break
-                    except Exception:
-                        break
-        
-        except Exception as e:
-            for symbol in instrument_keys_dict.keys():
-                shared["status"][symbol] = f"🔴 Error: {e}"
-            await asyncio.sleep(5)
-
-
-def start_multi_feed(instrument_keys_dict):
-    """Start WebSocket for multiple symbols"""
-    shared["stop_event"].clear()
-    t = threading.Thread(
-        target=lambda: asyncio.run(websocket_worker_multi(instrument_keys_dict)),
-        daemon=True
+        st.info("💡 **Solution:** Run the Daily Regime Analyzer first (Page 9)")
+        st.stop()
+    
+    st.success(f"✅ {len(results_df)} stocks shortlisted")
+    st.dataframe(results_df, use_container_width=True, hide_index=True)
+    
+    # Select stocks
+    selected_symbols = st.multiselect(
+        "Select stocks to monitor",
+        options=results_df['Symbol'].tolist(),
+        default=results_df['Symbol'].tolist()[:3]
     )
-    add_script_run_ctx(t)
-    t.start()
-
-
-def stop_feed():
-    """Stop WebSocket"""
-    shared["stop_event"].set()
-    for symbol in shared["status"].keys():
-        shared["status"][symbol] = "Stopped"
-
-
-# =====================================================================
-# UI
-# =====================================================================
-st.markdown("""
-**Connect to live market data and get INSTANT alerts when entry signals trigger.**
-
-**Process:**
-1. Enter your validated stocks (from Page 10)
-2. Click START to connect
-3. System monitors all stocks simultaneously
-4. Alerts you when entry conditions are met
-""")
-
-# ========== SECTION 1: Watch List Setup ==========
-st.header("1️⃣ Watch List Setup")
-
-watch_list_input = st.text_area(
-    "Enter Validated Symbols (one per line)",
-    value="SIEMENS\nADANIGREEN\nDLF",
-    height=100,
-    help="Enter symbols that passed validation on Page 10"
-)
-
-# Manual instrument key option
-st.markdown("---")
-manual_mode = st.checkbox("⚙️ Manual Instrument Key Entry", 
-                          help="Use this if instrument files are missing but you know the keys")
-
-manual_keys = {}
-if manual_mode:
-    st.info("💡 Find instrument keys on Upstox: Login → Market → Symbol → Copy instrument_key")
     
-    if watch_list_input:
-        watch_symbols = [s.strip() for s in watch_list_input.split('\n') if s.strip()]
-        
-        for symbol in watch_symbols:
-            key = st.text_input(f"Instrument Key for {symbol}", 
-                              key=f"manual_key_{symbol}",
-                              placeholder="NSE_EQ|INE...")
-            if key:
-                manual_keys[symbol] = key
-
-if watch_list_input:
-    watch_symbols = [s.strip() for s in watch_list_input.split('\n') if s.strip()]
-    st.success(f"✅ Monitoring {len(watch_symbols)} stocks: {', '.join(watch_symbols)}")
-else:
-    st.stop()
-
-# Get instrument keys (manual or from file)
-instrument_keys_dict = {}
-missing_symbols = []
-
-if manual_mode and manual_keys:
-    # Use manual keys
-    instrument_keys_dict = manual_keys
-    st.success(f"✅ Using manual instrument keys for {len(manual_keys)} symbols")
-else:
-    # Load from instruments file using existing infrastructure
-    instruments_df = load_segment_instruments("NSE_EQ")
+    if not selected_symbols:
+        st.warning("Please select at least one stock")
+        st.stop()
     
-    if instruments_df.empty:
-        st.error("❌ Instrument data not found.")
-        
-        # Diagnostics
-        st.subheader("🔍 Diagnostics")
-        
-        # Show expected location based on your infrastructure
-        from core.api.instruments import SEGMENT_DIR
-        expected_path = SEGMENT_DIR / "NSE_EQ.parquet"
-        
-        st.code(f"Looking for: {expected_path}")
-        
-        if expected_path.exists():
-            st.success(f"✅ File exists at: {expected_path}")
-            st.warning("⚠️ File exists but failed to load. Check file format.")
-            try:
-                test_df = pd.read_parquet(expected_path)
-                st.write("Columns found:", list(test_df.columns))
-                st.write("Sample data:")
-                st.dataframe(test_df.head())
-            except Exception as e:
-                st.error(f"Error reading file: {e}")
-        else:
-            st.warning(f"❌ File not found at: {expected_path}")
-            
-            # Check if directory exists
-            if SEGMENT_DIR.exists():
-                st.info(f"✅ Instruments directory exists: {SEGMENT_DIR}")
-                st.write("Files found:")
-                for file in SEGMENT_DIR.glob("*.parquet"):
-                    st.write(f"  - {file.name}")
+    # Get instrument keys and build symbol map
+    st.header("2️⃣ Instrument Mapping")
+    
+    instrument_map = {}
+    symbol_map = {}
+    regime_map = {}
+    
+    for _, row in results_df.iterrows():
+        symbol = row['Symbol']
+        if symbol in selected_symbols:
+            inst_key = get_instrument_key(symbol)
+            if inst_key:
+                instrument_map[symbol] = inst_key
+                symbol_map[inst_key] = symbol  # For API mapping
+                regime_map[symbol] = row.get('Regime', 'Unknown')
             else:
-                st.error(f"❌ Instruments directory not found: {SEGMENT_DIR}")
-            
-            st.markdown("---")
-            st.subheader("📋 How to Fix")
-            st.markdown("""
-            **Option 1: Download Instruments**
-            1. Go to **Page 1: Login & Instruments**
-            2. Click "Download Instruments" or "Download All Segments"
-            3. Wait for download to complete
-            4. Come back to this page
-            
-            **Option 2: Manual Symbol Entry**
-            - Check the "Manual Instrument Key Entry" box above
-            - Enter instrument keys for each symbol
-            """)
-        
+                st.warning(f"⚠️ No instrument key for {symbol}")
+    
+    if not instrument_map:
+        st.error("No valid instruments found")
         st.stop()
     
-    # Normalize column names (in case they're different)
-    col_map = {}
-    for col in instruments_df.columns:
-        c = col.lower().strip()
-        if c in ['tradingsymbol', 'trading_symbol', 'symbol']:
-            col_map[col] = 'tradingsymbol'
-        if c in ['instrument_key', 'key', 'token']:
-            col_map[col] = 'instrument_key'
+    st.success(f"✅ Mapped {len(instrument_map)} instruments")
     
-    if col_map:
-        instruments_df = instruments_df.rename(columns=col_map)
+    # Controls
+    st.header("3️⃣ Controls")
     
-    # Verify required columns exist
-    if 'tradingsymbol' not in instruments_df.columns or 'instrument_key' not in instruments_df.columns:
-        st.error("❌ Instrument file is missing required columns")
-        st.write("Expected: tradingsymbol, instrument_key")
-        st.write("Found:", list(instruments_df.columns))
+    col1, col2, col3 = st.columns(3)
+    
+    with col1:
+        refresh_interval = st.number_input(
+            "Refresh (seconds)",
+            min_value=10,
+            max_value=300,
+            value=60,
+            step=10
+        )
+    
+    with col2:
+        if st.button("🔄 Refresh Now", type="primary"):
+            st.rerun()
+    
+    with col3:
+        auto_refresh = st.checkbox("Auto Refresh", value=True)
+    
+    # Fetch live data
+    st.header("4️⃣ Live Data")
+    
+    token = get_access_token()
+    if not token:
+        st.error("No access token")
         st.stop()
     
-    # Get keys from instruments file
-    for symbol in watch_symbols:
-        match = instruments_df[instruments_df['tradingsymbol'] == symbol]
-        if not match.empty:
-            instrument_keys_dict[symbol] = match.iloc[0]['instrument_key']
-        else:
-            missing_symbols.append(symbol)
-
-if missing_symbols:
-    st.warning(f"⚠️ Could not find instrument keys for: {', '.join(missing_symbols)}")
-
-if not instrument_keys_dict:
-    st.error("❌ No valid symbols found")
-    st.stop()
-
-# ========== SECTION 2: Live Feed Controls ==========
-st.header("2️⃣ Live Feed Control")
-
-col1, col2, col3 = st.columns(3)
-
-with col1:
-    if st.button("▶️ START MONITORING", type="primary"):
-        # Initialize data storage
-        for symbol in instrument_keys_dict.keys():
-            st.session_state[f"live_df_{symbol}"] = pd.DataFrame(columns=["timestamp", "price", "volume"])
-            st.session_state[f"signal_status_{symbol}"] = "Starting..."
-        
-        # Start WebSocket
-        start_multi_feed(instrument_keys_dict)
-        st.success("✅ Live feed started")
-        time.sleep(1)
-        st.rerun()
-
-with col2:
-    if st.button("⏹️ STOP"):
-        stop_feed()
-        st.info("⏹️ Stopped")
-
-with col3:
-    if st.button("♻️ RESET"):
-        for symbol in instrument_keys_dict.keys():
-            st.session_state[f"live_df_{symbol}"] = pd.DataFrame(columns=["timestamp", "price", "volume"])
-        st.rerun()
-
-# ========== SECTION 3: Live Monitoring ==========
-st.header("3️⃣ Live Signal Status")
-
-# Process ticks for each symbol
-for symbol in instrument_keys_dict.keys():
-    # Initialize if needed
-    if f"live_df_{symbol}" not in st.session_state:
-        st.session_state[f"live_df_{symbol}"] = pd.DataFrame(columns=["timestamp", "price", "volume"])
+    api = UpstoxMarketData(token)
     
-    # Get ticks from queue
-    if symbol in shared["tick_queues"]:
-        while not shared["tick_queues"][symbol].empty():
-            tick = shared["tick_queues"][symbol].get()
-            st.session_state[f"live_df_{symbol}"] = pd.concat([
-                st.session_state[f"live_df_{symbol}"],
-                pd.DataFrame([tick])
-            ], ignore_index=True)
+    with st.spinner("Fetching market quotes..."):
+        inst_keys = list(instrument_map.values())
+        market_quotes = api.get_market_quote(inst_keys, symbol_map)
     
-    # Limit size
-    if len(st.session_state[f"live_df_{symbol}"]) > 5000:
-        st.session_state[f"live_df_{symbol}"] = st.session_state[f"live_df_{symbol}"].iloc[-5000:]
-
-# Display each symbol
-for symbol in instrument_keys_dict.keys():
-    with st.expander(f"📊 {symbol} - {shared['status'].get(symbol, 'Not Started')}", expanded=True):
-        
-        df_ticks = st.session_state[f"live_df_{symbol}"].copy()
-        
-        if df_ticks.empty:
-            st.info("⏳ Waiting for data...")
+    if not market_quotes:
+        st.error("Failed to fetch quotes")
+        st.stop()
+    
+    # Process each symbol
+    for symbol in selected_symbols:
+        if symbol not in instrument_map:
             continue
         
-        # Aggregate to 1-minute candles
-        df_ticks['timestamp'] = pd.to_datetime(df_ticks['timestamp'])
-        df_1m = df_ticks.set_index('timestamp').resample('1min').agg({
-            'price': ['first', 'max', 'min', 'last'],
-            'volume': 'sum'
-        }).dropna()
+        inst_key = instrument_map[symbol]
+        regime = regime_map.get(symbol, 'Unknown')
+        quote_data = market_quotes.get(inst_key, {})
         
-        df_1m.columns = ['Open', 'High', 'Low', 'Close', 'Volume']
+        if not quote_data:
+            st.warning(f"No data for {symbol}")
+            continue
+        
+        # DON'T save current quote as a candle - it's day-level OHLC, not 1-minute!
+        # The quote API returns:
+        #   ohlc.open = today's open (9:15 AM)
+        #   ohlc.high = today's high (from any time)
+        #   ohlc.low = today's low (from any time)
+        #   last_price = current price
+        # This creates fake candles with wrong OHLC!
+        
+        # Instead, rely on backfilled data which has real 1-minute candles
+        # current_candle = api.build_1min_candle(quote_data)
+        # save_live_candle(symbol, current_candle)  # REMOVED - causes fake candles
+        
+        # Load data
+        hist_df = fetch_historical_ohlcv(symbol, inst_key, days=5)
+        live_df = get_todays_cached_data(symbol)
+        
+        # Debug info
+        with st.expander(f"🔍 Data Debug: {symbol}", expanded=False):
+            st.write(f"**Historical data:** {len(hist_df)} candles")
+            if not hist_df.empty:
+                st.write(f"  - From: {hist_df.index.min()}")
+                st.write(f"  - To: {hist_df.index.max()}")
+            
+            st.write(f"**Live cache data:** {len(live_df)} candles")
+            if not live_df.empty:
+                st.write(f"  - From: {live_df.index.min()}")
+                st.write(f"  - To: {live_df.index.max()}")
+        
+        # Combine
+        if not hist_df.empty and not live_df.empty:
+            combined_df = pd.concat([hist_df, live_df])
+            combined_df = combined_df[~combined_df.index.duplicated(keep='last')]
+            combined_df.sort_index(inplace=True)
+            st.info(f"✅ Combined: {len(hist_df)} historical + {len(live_df)} live = {len(combined_df)} total candles")
+        elif not hist_df.empty:
+            combined_df = hist_df
+            st.info(f"📊 Using historical only: {len(combined_df)} candles")
+        elif not live_df.empty:
+            combined_df = live_df
+            st.info(f"📊 Using live cache only: {len(combined_df)} candles")
+        else:
+            st.warning(f"No data for {symbol}")
+            continue
         
         # Calculate indicators
-        df_1m = calculate_indicators(df_1m)
+        combined_df = calculate_indicators(combined_df)
         
-        # Detect entry signal
-        signal_result = detect_pullback_entry_live(df_1m, regime='Trending Bullish')
+        # Detect signal
+        signal = detect_entry_signal(combined_df, regime)
         
-        # Display status
-        col1, col2, col3, col4 = st.columns(4)
-        
-        with col1:
-            current_price = df_1m['Close'].iloc[-1] if len(df_1m) > 0 else 0
-            st.metric("Current Price", f"₹{current_price:.2f}")
-        
-        with col2:
-            status = signal_result['status']
-            if '🚀' in status:
-                st.success(status)
-            elif '⏳' in status:
-                st.warning(status)
+        # Display
+        with st.expander(f"📊 {symbol} - {regime}", expanded=True):
+            
+            # Current price
+            ohlc = quote_data.get('ohlc', {})
+            last_price = quote_data.get('last_price', 0)
+            volume = quote_data.get('volume', 0)
+            
+            open_price = ohlc.get('open', 0)
+            change = ((last_price - open_price) / open_price * 100) if open_price > 0 else 0
+            
+            # Show live price indicator
+            st.info(f"📡 **LIVE:** Current price from API (not on chart) - Use backfill for chart updates")
+            
+            # Metrics
+            col1, col2, col3, col4, col5 = st.columns(5)
+            
+            with col1:
+                st.metric("💹 LTP", f"₹{last_price:.2f}", f"{change:+.2f}%")
+            
+            with col2:
+                st.metric("🔺 High", f"₹{ohlc.get('high', 0):.2f}")
+            
+            with col3:
+                st.metric("🔻 Low", f"₹{ohlc.get('low', 0):.2f}")
+            
+            with col4:
+                vol_str = f"{volume/1000000:.2f}M" if volume >= 1000000 else f"{volume/1000:.1f}K"
+                st.metric("📊 Volume", vol_str)
+            
+            with col5:
+                st.metric("📈 Candles", len(combined_df))
+            
+            st.divider()
+            
+            # Add backfill button
+            col_a, col_b = st.columns([3, 1])
+            
+            with col_a:
+                st.caption(f"💡 **Tip:** Use backfill to get today's complete 1-minute candle data")
+            
+            with col_b:
+                if st.button(f"🔄 Backfill", key=f"backfill_{symbol}", help="Fetch today's full intraday data", use_container_width=True):
+                    with st.spinner(f"Backfilling {symbol}..."):
+                        try:
+                            # Fetch intraday data
+                            url = f"https://api.upstox.com/v2/historical-candle/intraday/{inst_key}/1minute"
+                            
+                            headers = {
+                                'Accept': 'application/json',
+                                'Authorization': f'Bearer {token}'
+                            }
+                            
+                            response = requests.get(url, headers=headers, timeout=30)
+                            
+                            if response.status_code == 200:
+                                data = response.json()
+                                
+                                if data.get('status') == 'success':
+                                    candles = data.get('data', {}).get('candles', [])
+                                    
+                                    if candles:
+                                        db = get_db()
+                                        inserted = 0
+                                        today = datetime.now().date()
+                                        
+                                        for candle in candles:
+                                            ts = pd.to_datetime(candle[0])
+                                            
+                                            if ts.date() == today:
+                                                try:
+                                                    db.con.execute(f"""
+                                                        INSERT OR REPLACE INTO {LIVE_CACHE_TABLE}
+                                                        (symbol, timestamp, open, high, low, close, volume)
+                                                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                                                    """, [
+                                                        symbol,
+                                                        ts,
+                                                        float(candle[1]),
+                                                        float(candle[2]),
+                                                        float(candle[3]),
+                                                        float(candle[4]),
+                                                        int(candle[5])
+                                                    ])
+                                                    inserted += 1
+                                                except:
+                                                    pass
+                                        
+                                        st.success(f"✅ Inserted {inserted} candles for {symbol}")
+                                        st.rerun()
+                                    else:
+                                        st.warning("No candles received")
+                                else:
+                                    st.error(f"API Error: {data.get('message')}")
+                            else:
+                                st.error(f"HTTP Error: {response.status_code}")
+                        
+                        except Exception as e:
+                            st.error(f"Error: {e}")
+            
+            st.divider()
+            
+            # Signal
+            if signal['signal']:
+                st.success(f"### {signal['status']}")
+                
+                col1, col2 = st.columns(2)
+                
+                with col1:
+                    st.write("**Trade Details:**")
+                    st.write(f"- Entry: ₹{signal['entry_price']:.2f}")
+                    st.write(f"- Stop Loss: ₹{signal['stop_loss']:.2f}")
+                    st.write(f"- Take Profit: ₹{signal['take_profit']:.2f}")
+                
+                with col2:
+                    st.write("**Risk/Reward:**")
+                    st.write(f"- Risk: ₹{signal['risk']:.2f}")
+                    st.write(f"- Reward: ₹{signal['reward']:.2f}")
+                    rr = signal['reward'] / signal['risk'] if signal['risk'] > 0 else 0
+                    st.write(f"- R:R: 1:{rr:.2f}")
+                
+                st.info(f"**Reason:** {signal['reason']}")
             else:
-                st.info(status)
-        
-        with col3:
-            st.metric("Candles", f"{len(df_1m)}/50")
-        
-        with col4:
-            if 'rsi' in signal_result:
-                st.metric("RSI", signal_result['rsi'])
-        
-        # If signal triggered
-        if signal_result['signal']:
-            st.balloons()
+                st.info(f"**Status:** {signal['status']}")
+                st.caption(f"Reason: {signal['reason']}")
             
-            st.success(f"### 🚀 BUY SIGNAL TRIGGERED!")
-            
-            col1, col2, col3 = st.columns(3)
-            col1.metric("Entry Price", f"₹{signal_result['entry_price']}")
-            col2.metric("Stop Loss", f"₹{signal_result['stop_loss']}")
-            col3.metric("Target", f"₹{signal_result['target']}")
-            
-            st.info(f"**Reason:** {signal_result['reason']}")
-            
-            # Execution instructions
-            st.markdown("### 📋 Execute Now:")
-            st.code(f"""
-1. Place LIMIT order: {symbol} @ ₹{signal_result['entry_price']}
-2. Set STOP LOSS: ₹{signal_result['stop_loss']}
-3. Set TARGET: ₹{signal_result['target']}
-4. Calculate position size (1% risk)
-            """)
-        
-        # Show chart
-        if len(df_1m) >= 20:
-            recent = df_1m.tail(60)
-            
-            fig = go.Figure(data=[go.Candlestick(
-                x=recent.index,
-                open=recent['Open'],
-                high=recent['High'],
-                low=recent['Low'],
-                close=recent['Close']
-            )])
-            
-            # Add EMA lines
-            if 'EMA_21' in recent.columns:
-                fig.add_trace(go.Scatter(
-                    x=recent.index, y=recent['EMA_21'],
-                    mode='lines', name='EMA 21',
-                    line=dict(color='orange', width=1)
-                ))
-            
-            if 'EMA_9' in recent.columns:
-                fig.add_trace(go.Scatter(
-                    x=recent.index, y=recent['EMA_9'],
-                    mode='lines', name='EMA 9',
-                    line=dict(color='blue', width=1)
-                ))
-            
-            fig.update_layout(
-                height=400,
-                xaxis_rangeslider_visible=False,
-                title=f"{symbol} - 1min Chart"
-            )
-            
-            st.plotly_chart(fig, use_container_width=True)
+            # Chart
+            if len(combined_df) >= 30:
+                with st.expander("📈 Chart", expanded=False):
+                    # Controls row
+                    col_range, col_volume = st.columns([3, 1])
+                    
+                    with col_range:
+                        # Show different time ranges based on selection
+                        chart_range = st.radio(
+                            "Time Range",
+                            options=["Last Hour (60min)", "Last 2 Hours (120min)", "Today Only", "Full Data"],
+                            index=1,
+                            horizontal=True,
+                            key=f"chart_range_{symbol}"
+                        )
+                    
+                    with col_volume:
+                        show_volume = st.checkbox("Show Volume", value=False, key=f"volume_{symbol}")
+                    
+                    # Select data based on range
+                    if chart_range == "Last Hour (60min)":
+                        chart_df = combined_df.tail(60)
+                    elif chart_range == "Last 2 Hours (120min)":
+                        chart_df = combined_df.tail(120)
+                    elif chart_range == "Today Only":
+                        # Get only today's data
+                        today = datetime.now().date()
+                        chart_df = combined_df[combined_df.index.date == today]
+                    else:  # Full Data
+                        chart_df = combined_df.tail(390)  # Last full trading day
+                    
+                    if len(chart_df) == 0:
+                        st.warning("No data for selected range")
+                    else:
+                        fig = go.Figure()
+                        
+                        # Candlestick
+                        fig.add_trace(go.Candlestick(
+                            x=chart_df.index,
+                            open=chart_df['Open'],
+                            high=chart_df['High'],
+                            low=chart_df['Low'],
+                            close=chart_df['Close'],
+                            name='Price',
+                            increasing_line_color='#26a69a',
+                            decreasing_line_color='#ef5350'
+                        ))
+                        
+                        # EMA 21
+                        if 'EMA_21' in chart_df.columns:
+                            fig.add_trace(go.Scatter(
+                                x=chart_df.index,
+                                y=chart_df['EMA_21'],
+                                mode='lines',
+                                name='EMA 21',
+                                line=dict(color='orange', width=2),
+                                opacity=0.8
+                            ))
+                        
+                        # EMA 9
+                        if 'EMA_9' in chart_df.columns:
+                            fig.add_trace(go.Scatter(
+                                x=chart_df.index,
+                                y=chart_df['EMA_9'],
+                                mode='lines',
+                                name='EMA 9',
+                                line=dict(color='blue', width=1.5),
+                                opacity=0.7
+                            ))
+                        
+                        # Volume (optional)
+                        if show_volume:
+                            fig.add_trace(go.Bar(
+                                x=chart_df.index,
+                                y=chart_df['Volume'],
+                                name='Volume',
+                                yaxis='y2',
+                                opacity=0.2,
+                                marker_color='lightgray',
+                                showlegend=False,
+                                hovertemplate='Volume: %{y:,}<extra></extra>'
+                            ))
+                        
+                        # Calculate proper y-axis ranges
+                        price_min = chart_df['Low'].min()
+                        price_max = chart_df['High'].max()
+                        price_range = price_max - price_min
+                        price_padding = price_range * 0.05  # 5% padding
+                        
+                        # Base layout (without volume)
+                        layout_config = {
+                            'height': 500,
+                            'xaxis_rangeslider_visible': False,
+                            'margin': dict(l=10, r=10, t=30, b=0),
+                            'hovermode': 'x unified',
+                            'template': 'plotly_white',
+                            'showlegend': True,
+                            'legend': dict(
+                                orientation="h",
+                                yanchor="bottom",
+                                y=1.02,
+                                xanchor="right",
+                                x=1
+                            ),
+                            'xaxis': dict(
+                                title="Time",
+                                gridcolor='#e8e8e8',
+                                showgrid=True
+                            ),
+                            'yaxis': dict(
+                                title="Price (₹)",
+                                gridcolor='#e8e8e8',
+                                showgrid=True,
+                                range=[price_min - price_padding, price_max + price_padding],
+                                fixedrange=False
+                            )
+                        }
+                        
+                        # Add volume axis if enabled
+                        if show_volume:
+                            volume_max = chart_df['Volume'].max()
+                            layout_config['yaxis2'] = dict(
+                                overlaying='y',
+                                side='right',
+                                showticklabels=False,
+                                showgrid=False,
+                                range=[0, volume_max * 8],
+                                fixedrange=True
+                            )
+                        
+                        fig.update_layout(**layout_config)
+                        
+                        st.plotly_chart(fig, use_container_width=True)
+                        
+                        # Data info
+                        st.caption(f"Showing {len(chart_df)} candles | From: {chart_df.index.min()} | To: {chart_df.index.max()}")
+    
+    # Auto refresh
+    if auto_refresh:
+        st.caption(f"⏱️ Refreshing in {refresh_interval} seconds...")
+        time.sleep(refresh_interval)
+        st.rerun()
 
-# Auto-refresh
-if not shared["stop_event"].is_set():
-    time.sleep(1)
-    st.rerun()
+if __name__ == "__main__":
+    main()

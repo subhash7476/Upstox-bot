@@ -12,6 +12,8 @@ import pandas as pd
 from pathlib import Path
 import sys
 import os
+from core.indicators import compute_supertrend
+from core.config import get_access_token
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if ROOT not in sys.path:
