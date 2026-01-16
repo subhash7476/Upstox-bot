@@ -22,7 +22,7 @@ for stock_dir in DERIVED_ROOT.iterdir():
     stock_name = stock_dir.name
     
     # Look for 15-minute data
-    timeframe_dir = stock_dir / "15minute"
+    timeframe_dir = stock_dir / "1day"
     if not timeframe_dir.exists():
         continue
     
